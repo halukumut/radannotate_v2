@@ -1,5 +1,55 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
+// ── Image Cache Hook ──────────────────────────────────────────────────────
+// Pre-loads images to reduce lag when switching between images
+function useImageCache(sessionImgs, currentIdx) {
+  const cacheRef = useRef(new Map());
+  const [preloadedUrls, setPreloadedUrls] = useState(new Set());
+
+  // Pre-cache next image and session starter images
+  useEffect(() => {
+    if (!sessionImgs.length) return;
+
+    const toLoad = new Set();
+
+    // Add next image
+    if (currentIdx + 1 < sessionImgs.length) {
+      toLoad.add(sessionImgs[currentIdx + 1].url);
+    }
+
+    // Add first two images of session (if not already loaded)
+    if (currentIdx === 0 && sessionImgs.length > 0) {
+      toLoad.add(sessionImgs[0].url);
+      if (sessionImgs.length > 1) toLoad.add(sessionImgs[1].url);
+    }
+
+    toLoad.forEach((url) => {
+      if (preloadedUrls.has(url)) return; // Skip if already loaded
+      const img = new Image();
+      img.onload = () => {
+        cacheRef.current.set(url, img);
+        setPreloadedUrls((prev) => new Set([...prev, url]));
+      };
+      img.src = url;
+    });
+
+    return () => {
+      // Clean up cache when moving to next image
+      const urlsToKeep = new Set([
+        sessionImgs[currentIdx]?.url,
+        sessionImgs[currentIdx + 1]?.url,
+      ]);
+      cacheRef.current.forEach((_, url) => {
+        if (!urlsToKeep.has(url)) {
+          cacheRef.current.delete(url);
+        }
+      });
+    };
+  }, [sessionImgs, currentIdx, preloadedUrls]);
+
+  return cacheRef.current;
+}
+
 // ── Renk paleti ───────────────────────────────────────────────────────────
 const C = {
   bg:"#0a0c10",surface:"#111318",surfaceAlt:"#161922",border:"#1e2230",
@@ -379,8 +429,256 @@ function PredPanel({pred}){
   );
 }
 
+// ── Comparison Canvas (보기 전용, bbox 표시) ─────────────────────────────────
+function ComparisonCanvas({imageData,physicianBoxes,gtYoloBoxes,predBoxes,showGt,showPhysician,showPred}){
+  const ASPECT_RATIO = 700 / 900;
+  const [canvasSize, setCanvasSize] = useState({w:700,h:900});
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+  const imgDimsRef = useRef({w:1,h:1});
+  const displayDimsRef = useRef({ox:0, oy:0, w:700, h:467});
+  const canvasSizeRef = useRef(canvasSize);
+  useEffect(()=>{canvasSizeRef.current=canvasSize;},[canvasSize]);
+
+  useEffect(()=>{
+    const ro = new ResizeObserver(([e])=>{
+      const w=e.contentRect.width;
+      const maxW=Math.min(w,700);
+      setCanvasSize({w:maxW, h:Math.round(maxW/ASPECT_RATIO)});
+    });
+    if(canvasRef.current?.parentElement) ro.observe(canvasRef.current.parentElement);
+    return ()=>ro.disconnect();
+  },[]);
+
+  useEffect(()=>{
+    if(!imgRef.current) return;
+    const iw = imgRef.current.naturalWidth || imgRef.current.width;
+    const ih = imgRef.current.naturalHeight || imgRef.current.height;
+    if(iw>0 && ih>0) {
+      imgDimsRef.current = {w:iw, h:ih};
+      const {w: CANVAS_W, h: CANVAS_H} = canvasSizeRef.current;
+      const scale = Math.min(CANVAS_W / iw, CANVAS_H / ih);
+      const displayW = Math.round(iw * scale);
+      const displayH = Math.round(ih * scale);
+      const ox = Math.round((CANVAS_W - displayW) / 2);
+      const oy = Math.round((CANVAS_H - displayH) / 2);
+      displayDimsRef.current = {ox, oy, w: displayW, h: displayH};
+    }
+  },[imageData?.url]);
+
+  useEffect(()=>{
+    if(!imageData?.url) return;
+    const img=new Image();
+    img.onload=()=>{imgRef.current=img; draw();};
+    img.onerror=()=>{imgRef.current=null; draw();};
+    img.src=imageData.url;
+  },[imageData?.url]);
+
+  const draw = useCallback(()=>{
+    const canvas=canvasRef.current; if(!canvas) return;
+    const ctx=canvas.getContext("2d");
+    const {w: CANVAS_W, h: CANVAS_H} = canvasSizeRef.current;
+    canvas.width=CANVAS_W; canvas.height=CANVAS_H;
+
+    ctx.fillStyle="#060810"; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+
+    const {ox, oy, w: displayW, h: displayH} = displayDimsRef.current;
+    if(imgRef.current){
+      ctx.drawImage(imgRef.current, ox, oy, displayW, displayH);
+    } else {
+      ctx.strokeStyle="#1a2030"; ctx.lineWidth=1;
+      for(let x=0;x<CANVAS_W;x+=32){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,CANVAS_H);ctx.stroke();}
+      for(let y=0;y<CANVAS_H;y+=32){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(CANVAS_W,y);ctx.stroke();}
+      ctx.fillStyle=C.textDim; ctx.font="12px monospace"; ctx.textAlign="center";
+      ctx.fillText(imageData?.file??"Görsel bekleniyor…",CANVAS_W/2,CANVAS_H/2);
+      ctx.textAlign="left";
+    }
+
+    const drawBox=(rect,color,dash,label,alpha=1)=>{
+      const px = ox + rect.x * displayW, py = oy + rect.y * displayH, pw = rect.w * displayW, ph = rect.h * displayH;
+      ctx.globalAlpha=alpha;
+      ctx.strokeStyle=color; ctx.lineWidth=2;
+      if(dash) ctx.setLineDash(dash); else ctx.setLineDash([]);
+      ctx.strokeRect(px,py,pw,ph);
+      ctx.fillStyle=color+"20"; ctx.fillRect(px,py,pw,ph);
+      ctx.setLineDash([]);
+      if(label){
+        const tw=ctx.measureText(label).width+8;
+        ctx.fillStyle=color+"ee";
+        ctx.fillRect(px,py-16,tw,16);
+        ctx.fillStyle="#fff"; ctx.font="bold 10px monospace";
+        ctx.fillText(label,px+4,py-4);
+      }
+      ctx.globalAlpha=1;
+    };
+
+    if(showGt && gtYoloBoxes?.length){
+      gtYoloBoxes.forEach((gb,i)=>{
+        drawBox(yoloToRect(gb), C.gt, [5,4],
+          gtYoloBoxes.length>1?`GT #${i+1}`:"GT");
+      });
+    }
+
+    if(showPred && predBoxes?.length){
+      predBoxes.forEach((pb,i)=>{
+        const col=confColor(pb.conf??1);
+        drawBox(yoloToRect(pb), col, [8,4],
+          `AI ${Math.round((pb.conf??1)*100)}%${predBoxes.length>1?` #${i+1}`:""}`,
+          0.9);
+      });
+    }
+
+    if(showPhysician && physicianBoxes?.length){
+      physicianBoxes.forEach((b,i)=>{
+        drawBox(b, C.physician, null,
+          physicianBoxes.length>1?`#${i+1}`:"Hekim",
+          1);
+      });
+    }
+  },[imageData,gtYoloBoxes,predBoxes,physicianBoxes,showGt,showPhysician,showPred,canvasSize]);
+
+  useEffect(()=>{draw();},[draw]);
+
+  const {w,h}=canvasSize;
+  return <canvas ref={canvasRef} width={w} height={h}
+    style={{width:w,height:h,borderRadius:8,border:`1px solid ${C.border}`,display:"block",userSelect:"none"}}
+  />;
+}
+
+// ── Comparison View (Results detaylı görünüş) ─────────────────────────────
+function ComparisonView({result,sessionImgs,onBack,onFeedbackSubmit}){
+  const imageData=sessionImgs.find(img=>img.id===result.imageId);
+  const [feedback,setFeedback]=useState(result.feedback||"");
+  const [submitted,setSubmitted]=useState(!!result.feedback);
+  const [showGt,setShowGt]=useState(true);
+  const [showPhysician,setShowPhysician]=useState(true);
+  const [showPred,setShowPred]=useState(imageData?.pred?.length>0);
+
+  const handleSubmit=()=>{
+    onFeedbackSubmit(result.imageId,feedback);
+    setSubmitted(true);
+  };
+
+  return (
+    <div style={{paddingTop:20}}>
+      <button onClick={onBack} style={{marginBottom:20,padding:"8px 16px",borderRadius:6,border:`1px solid ${C.border}`,background:C.surface,color:C.text,fontSize:12,fontWeight:600,cursor:"pointer"}}>
+        ← Rapor'a Dön
+      </button>
+
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:4}}>Görsel: {result.stem}</div>
+        <div style={{fontSize:12,color:C.textMuted}}>Oturum: {result.setId} · Durum: {result.status}</div>
+      </div>
+
+      {/* Bbox Toggle Buttons */}
+      <div style={{display:"flex",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+        <button onClick={()=>setShowGt(v=>!v)}
+          style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${C.gt}44`,background:showGt?`${C.gt}22`:"transparent",color:C.gt,fontSize:12,cursor:"pointer",fontWeight:500}}>
+          {showGt?"✓ GT":"GT"} Göster
+        </button>
+        <button onClick={()=>setShowPhysician(v=>!v)}
+          style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${C.physician}44`,background:showPhysician?`${C.physician}22`:"transparent",color:C.physician,fontSize:12,cursor:"pointer",fontWeight:500}}>
+          {showPhysician?"✓ Hekim":"Hekim"} Göster
+        </button>
+        {imageData?.pred?.length>0&&(
+          <button onClick={()=>setShowPred(v=>!v)}
+            style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${C.ai}44`,background:showPred?`${C.ai}22`:"transparent",color:C.ai,fontSize:12,cursor:"pointer",fontWeight:500}}>
+            {showPred?"✓ AI":"AI"} Göster
+          </button>
+        )}
+      </div>
+
+      {imageData&&(
+        <div style={{marginBottom:20,borderRadius:12,border:`1px solid ${C.border}`,overflow:"hidden",background:C.surface}}>
+          <ComparisonCanvas 
+            imageData={imageData} 
+            physicianBoxes={result.boxes||[]} 
+            gtYoloBoxes={imageData.gt||[]}
+            predBoxes={imageData.pred||[]}
+            showGt={showGt}
+            showPhysician={showPhysician}
+            showPred={showPred}
+          />
+        </div>
+      )}
+
+      {/* İstatistikler */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+        <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:12}}>
+          <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>GT Bbox Sayısı</div>
+          <div style={{fontSize:20,fontWeight:700,color:C.gt}}>{result.gtBoxCount}</div>
+        </div>
+        <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:12}}>
+          <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>Hekim Bbox Sayısı</div>
+          <div style={{fontSize:20,fontWeight:700,color:C.physician}}>{result.physicianBoxCount}</div>
+        </div>
+        <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:12}}>
+          <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>IoU Skoru</div>
+          <div style={{fontSize:20,fontWeight:700,color:result.iou!==null?(result.iou>0.5?C.success:C.danger):C.textDim}}>
+            {result.iou!==null?result.iou.toFixed(2):"—"}
+          </div>
+        </div>
+      </div>
+
+      {/* Doğruluk göstergesi */}
+      <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:14,marginBottom:20}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+          <div style={{fontSize:12,fontWeight:600,color:C.text}}>Karar Doğruluğu</div>
+          <Badge color={result.labelCorrect?C.success:C.danger}>{result.labelCorrect?"DOĞRU":"YANLIŞ"}</Badge>
+        </div>
+        <div style={{fontSize:12,color:C.textMuted,lineHeight:1.6}}>
+          {result.gtBoxCount>0
+            ?(result.physicianBoxCount>0&&result.iou!==null
+              ?`GT patoloji tespit edildi · Hekim buldu · IoU: ${result.iou.toFixed(3)}`
+              :result.physicianBoxCount===0
+              ?`GT patoloji var ama hekim kaçırdı`
+              :`Hekim hatalı işaretledi`)
+            :result.physicianBoxCount===0
+            ?`GT patoloji yok · Hekim doğru (true negative)`
+            :`Hekim yanlış işaretledi (false positive)`}
+        </div>
+      </div>
+
+      {/* Feedback alanı */}
+      <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:14,marginBottom:14}}>
+        <label style={{display:"block",fontSize:12,fontWeight:600,color:C.text,marginBottom:10}}>
+          Geri Bildirim / Notlar
+        </label>
+        <textarea
+          value={feedback}
+          onChange={(e)=>setFeedback(e.target.value)}
+          placeholder="Bu görselle ilgili yorumlarınız..."
+          style={{
+            width:"100%",
+            minHeight:80,
+            padding:10,
+            borderRadius:6,
+            border:`1px solid ${C.border}`,
+            background:C.bg,
+            color:C.text,
+            fontFamily:"'DM Sans', sans-serif",
+            fontSize:12,
+            resize:"vertical",
+            outline:"none"
+          }}
+          onFocus={(e)=>e.target.style.borderColor=C.accent}
+          onBlur={(e)=>e.target.style.borderColor=C.border}
+        />
+        <div style={{fontSize:11,color:C.textMuted,marginTop:8}}>
+          {feedback.length} karakter {submitted&&"· Kaydedildi"}
+        </div>
+      </div>
+
+      <button onClick={handleSubmit}
+        style={{width:"100%",padding:12,background:C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:14,fontWeight:600,cursor:"pointer"}}>
+        {submitted?"✓ Geri Bildirimi Güncelle":"Geri Bildirim Kaydet"}
+      </button>
+    </div>
+  );
+}
+
 // ── Rapor ─────────────────────────────────────────────────────────────────
-function ReportView({results,mode,onReset}){
+function ReportView({results,mode,onReset,sessionImgs}){
   const avg=(arr)=>arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;
   const times=results.map(r=>r.time);
   const ious=results.map(r=>r.iou).filter(v=>v!==null);
@@ -392,10 +690,12 @@ function ReportView({results,mode,onReset}){
 
   const [saveStatus,setSaveStatus]=useState("pending");
   const [savedUrl,setSavedUrl]=useState(null);
+  const [selectedResult,setSelectedResult]=useState(null);
+  const [resultsWithFeedback,setResultsWithFeedback]=useState(results);
 
   useEffect(()=>{
     setSaveStatus("saving");
-    const payload={sessionId:`session_${Date.now()}`,mode,physicianId:"demo-user",completedAt:new Date().toISOString(),results};
+    const payload={sessionId:`session_${Date.now()}`,mode,physicianId:"demo-user",completedAt:new Date().toISOString(),results:resultsWithFeedback};
     fetch("/api/stats",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
       .then(r=>r.json())
       .then(d=>setSaveStatus(d.ok?"saved":"error"))
@@ -405,6 +705,24 @@ function ReportView({results,mode,onReset}){
         setSaveStatus("download");
       });
   },[]); // eslint-disable-line
+
+  const handleFeedbackSubmit=(imageId,feedback)=>{
+    setResultsWithFeedback(prev=>prev.map(r=>r.imageId===imageId?{...r,feedback}:r));
+    // Optionally, send to server immediately
+    const result=resultsWithFeedback.find(r=>r.imageId===imageId);
+    if(result){
+      const updated={...result,feedback};
+      fetch(`/api/stats?update=${result.imageId}`,{
+        method:"PATCH",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({feedback})
+      }).catch(()=>{}); // Silent fail if offline
+    }
+  };
+
+  if(selectedResult){
+    return <ComparisonView result={selectedResult} sessionImgs={sessionImgs} onBack={()=>setSelectedResult(null)} onFeedbackSubmit={handleFeedbackSubmit}/>;
+  }
 
   const iouColor=avgIou>0.7?C.success:avgIou>0.5?C.warning:C.danger;
   const accColor=accuracy>0.8?C.success:accuracy>0.6?C.warning:C.danger;
@@ -447,8 +765,13 @@ function ReportView({results,mode,onReset}){
       <div style={{marginBottom:20}}>
         <div style={{fontSize:12,fontWeight:600,color:C.textMuted,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.06em"}}>Görsel Bazlı Sonuçlar</div>
         <div style={{display:"flex",flexDirection:"column",gap:5}}>
-          {results.map((r,i)=>(
-            <div key={i} style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px 12px",display:"grid",gridTemplateColumns:"26px 1fr 68px 80px 88px",alignItems:"center",gap:8}}>
+          {resultsWithFeedback.map((r,i)=>(
+            <div key={i} 
+              onClick={()=>setSelectedResult(r)}
+              style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px 12px",display:"grid",gridTemplateColumns:"26px 1fr 68px 80px 88px 40px",alignItems:"center",gap:8,cursor:"pointer",transition:"all 0.2s"}}
+              onMouseEnter={(e)=>e.currentTarget.style.borderColor=C.accent+"88"}
+              onMouseLeave={(e)=>e.currentTarget.style.borderColor=C.border}
+            >
               <span style={{fontSize:11,color:C.textDim,fontFamily:"monospace"}}>#{String(i+1).padStart(2,"0")}</span>
               <div style={{fontSize:11,color:C.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.stem}</div>
               <div style={{textAlign:"right",fontSize:12,color:C.accent,fontFamily:"monospace"}}>{formatTime(r.time)}</div>
@@ -456,6 +779,7 @@ function ReportView({results,mode,onReset}){
                 {r.iou!==null?`${r.iou.toFixed(2)} IoU`:"— boş"}
               </div>
               <div style={{textAlign:"right"}}><Badge color={r.labelCorrect?C.success:C.danger}>{r.labelCorrect?"DOĞRU":"YANLIŞ"}</Badge></div>
+              <div style={{textAlign:"right",fontSize:11,color:r.feedback?C.success:C.textDim}}>{r.feedback?"📝":"—"}</div>
             </div>
           ))}
         </div>
@@ -495,6 +819,9 @@ export default function App(){
   const [startTime,setStartTime]= useState(null);
   const [showGt,   setShowGt]   = useState(false);
   const [showPred, setShowPred] = useState(true);
+
+  // Image cache for pre-loading
+  const imageCache = useImageCache(sessionImgs, imgIdx);
 
   const imageData = sessionImgs[imgIdx] ?? null;
 
@@ -729,7 +1056,7 @@ export default function App(){
           </div>
         )}
 
-        {phase==="report"&&<ReportView results={results} mode={mode} onReset={reset}/>}
+        {phase==="report"&&<ReportView results={results} mode={mode} onReset={reset} sessionImgs={sessionImgs}/>}
       </div>
     </div>
   );

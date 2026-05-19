@@ -5,6 +5,7 @@
  * GET  /api/stats?mode=solo    → filtreli
  * GET  /api/stats?summary=true → ham bbox'lar gizli
  * POST /api/stats              → yeni oturum kaydeder
+ * PATCH /api/stats             → oturum içinde feedback günceller (body: {imageId, feedback})
  *
  * Ortam değişkenleri (Vercel Dashboard > Settings > Environment Variables):
  *   UPSTASH_REDIS_REST_URL
@@ -19,15 +20,15 @@ import { Redis } from "@upstash/redis";
 const SESSIONS_KEY = "radannotate:sessions";
 
 // Redis bağlantısı (env yoksa hata fırlatır — Vercel'de tanımlı olmalı)
-function getRedis() {
-  const url   = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) {
-    throw new Error(
-      "UPSTASH_REDIS_REST_URL ve UPSTASH_REDIS_REST_TOKEN env değişkenleri tanımlı değil."
-    );
-  }
-  return new Redis({ url, token });
+  function getRedis() {
+    const url   = process.env.UPSTASH_REDIS_REST_URL;
+    const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+    if (!url || !token) {
+      throw new Error(
+        "UPSTASH_REDIS_REST_URL ve UPSTASH_REDIS_REST_TOKEN env değişkenleri tanımlı değil."
+      );
+    }
+    return new Redis({ url, token });
 }
 
 // ── Yardımcılar ───────────────────────────────────────────────────────────
@@ -142,6 +143,46 @@ export default async function handler(req, res) {
       totalSessions: sessions.length,
       aggregate:     buildAggregate(sessions),
       sessions:      output,
+    });
+  }
+
+  // ── PATCH /api/stats ──────────────────────────────────────────────────
+  // Feedback güncelle (oturum içindeki belirli bir görsel için)
+  if (req.method === "PATCH") {
+    const { imageId, feedback } = req.body || {};
+
+    if (!imageId) {
+      return res.status(400).json({ ok: false, error: "imageId gerekli" });
+    }
+
+    // Tüm oturumları al ve ara
+    const raw = await redis.lrange(SESSIONS_KEY, 0, -1);
+    let sessions = raw.map(item =>
+      typeof item === "string" ? JSON.parse(item) : item
+    );
+
+    let updated = false;
+
+    // Son oturumda feedback'i güncelle (genellikle en son gönderilen oturum)
+    if (sessions.length > 0) {
+      const lastSession = sessions[sessions.length - 1];
+      if (lastSession.results) {
+        const resultIdx = lastSession.results.findIndex(r => r.imageId === imageId);
+        if (resultIdx >= 0) {
+          lastSession.results[resultIdx].feedback = feedback;
+          // Tüm listeyi güncelle
+          await redis.del(SESSIONS_KEY);
+          for (const session of sessions) {
+            await redis.rpush(SESSIONS_KEY, JSON.stringify(session));
+          }
+          updated = true;
+        }
+      }
+    }
+
+    return res.status(updated ? 200 : 404).json({
+      ok: updated,
+      message: updated ? "Feedback kaydedildi" : "Görsel bulunamadı",
     });
   }
 
