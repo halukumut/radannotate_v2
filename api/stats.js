@@ -62,10 +62,10 @@ function buildSummary(results) {
 
 function buildAggregate(sessions) {
   if (!sessions.length) return null;
-  const allTimes   = sessions.flatMap(s => (s.results || []).map(r => r.time));
-  const allIous    = sessions.flatMap(s => (s.results || []).map(r => r.iou).filter(Boolean));
-  const allCorrect = sessions.reduce((acc, s) => acc + (s.summary?.correctCount || 0), 0);
-  const allImages  = sessions.reduce((acc, s) => acc + (s.summary?.imageCount  || 0), 0);
+  const allTimes   = sessions.map(s => s.stats?.totalTimeMs || 0).filter(Boolean);
+  const allIous    = sessions.map(s => s.stats?.avgIou).filter(Boolean);
+  const allCorrect = sessions.reduce((acc, s) => acc + (s.stats?.correctCount || 0), 0);
+  const allImages  = sessions.reduce((acc, s) => acc + (s.stats?.imageCount  || 0), 0);
 
   return {
     totalSessions:      sessions.length,
@@ -99,33 +99,76 @@ export default async function handler(req, res) {
 
   // ── POST /api/stats ───────────────────────────────────────────────────
   if (req.method === "POST") {
-    const { sessionId, mode, physicianId, completedAt, results } = req.body || {};
+    const { physicianId, mode, completedAt, stats, sessionFeedback } = req.body || {};
 
-    if (!Array.isArray(results)) {
-      return res.status(400).json({ ok: false, error: "results dizisi zorunlu" });
+    if (!stats || typeof stats !== "object") {
+      return res.status(400).json({ ok: false, error: "stats nesnesi gerekli" });
     }
 
-    const summary = buildSummary(results);
-    const record  = {
-      sessionId:   sessionId   || `session_${Date.now()}`,
-      mode:        mode        || "unknown",
+    const sessionId = `${physicianId}_${mode}_${Date.now()}`;
+    const record = {
+      sessionId,
+      mode: mode || "unknown",
       physicianId: physicianId || "anonymous",
       completedAt: completedAt || new Date().toISOString(),
-      summary,
-      results,
+      stats,
+      sessionFeedback: sessionFeedback || null,
+      comparison: null
     };
 
-    // Redis listesine ekle (sağdan push — en yeni sonda)
+    // Check for matching session (opposite mode, same physician)
+    const raw = await redis.lrange(SESSIONS_KEY, 0, -1);
+    let sessions = raw.map(item => typeof item === "string" ? JSON.parse(item) : item);
+    
+    const oppositeMode = mode === "solo" ? "ai" : "solo";
+    const matchingSession = sessions.find(s => 
+      s.physicianId === physicianId && s.mode === oppositeMode
+    );
+
+    if (matchingSession && matchingSession.stats) {
+      const timeDiff = matchingSession.stats.totalTimeMs - record.stats.totalTimeMs;
+      const timeSavingsPct = matchingSession.stats.totalTimeMs > 0 
+        ? +((timeDiff / matchingSession.stats.totalTimeMs) * 100).toFixed(2)
+        : 0;
+      const accuracyGain = +(record.stats.accuracyRate - matchingSession.stats.accuracyRate).toFixed(4);
+      const iouGain = record.stats.avgIou && matchingSession.stats.avgIou
+        ? +(record.stats.avgIou - matchingSession.stats.avgIou).toFixed(4)
+        : null;
+
+      record.comparison = {
+        matchedWith: matchingSession.sessionId,
+        matchedMode: oppositeMode,
+        timeDiffMs: timeDiff,
+        timeSavingsPct,
+        accuracyGain,
+        iouGain,
+        timestamp: new Date().toISOString()
+      };
+
+      matchingSession.comparison = {
+        matchedWith: sessionId,
+        matchedMode: mode,
+        timeDiffMs: -timeDiff,
+        timeSavingsPct: -timeSavingsPct,
+        accuracyGain: -accuracyGain,
+        iouGain: iouGain ? -iouGain : null,
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    await redis.del(SESSIONS_KEY);
+    for (const session of sessions) {
+      await redis.rpush(SESSIONS_KEY, JSON.stringify(session));
+    }
     await redis.rpush(SESSIONS_KEY, JSON.stringify(record));
 
-    return res.status(201).json({ ok: true, sessionId: record.sessionId, summary });
+    return res.status(201).json({ ok: true, sessionId, stats: record.stats, comparison: record.comparison });
   }
 
   // ── GET /api/stats ────────────────────────────────────────────────────
   if (req.method === "GET") {
     const raw = await redis.lrange(SESSIONS_KEY, 0, -1);
 
-    // Redis lrange string dizisi döner — parse et
     let sessions = raw.map(item =>
       typeof item === "string" ? JSON.parse(item) : item
     );
@@ -135,9 +178,7 @@ export default async function handler(req, res) {
     if (mode)      sessions = sessions.filter(s => s.mode        === mode);
     if (physician) sessions = sessions.filter(s => s.physicianId === physician);
 
-    const output = summaryOnly === "true"
-      ? sessions.map(({ results: _r, ...rest }) => rest)
-      : sessions;
+    const output = sessions;
 
     return res.status(200).json({
       totalSessions: sessions.length,
@@ -147,42 +188,33 @@ export default async function handler(req, res) {
   }
 
   // ── PATCH /api/stats ──────────────────────────────────────────────────
-  // Feedback güncelle (oturum içindeki belirli bir görsel için)
+  // Update session feedback
   if (req.method === "PATCH") {
-    const { imageId, feedback } = req.body || {};
+    const { sessionId, sessionFeedback } = req.body || {};
 
-    if (!imageId) {
-      return res.status(400).json({ ok: false, error: "imageId gerekli" });
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: "sessionId gerekli" });
     }
 
-    // Tüm oturumları al ve ara
     const raw = await redis.lrange(SESSIONS_KEY, 0, -1);
-    let sessions = raw.map(item =>
-      typeof item === "string" ? JSON.parse(item) : item
-    );
+    let sessions = raw.map(item => typeof item === "string" ? JSON.parse(item) : item);
 
     let updated = false;
 
-    // Son oturumda feedback'i güncelle (genellikle en son gönderilen oturum)
-    if (sessions.length > 0) {
-      const lastSession = sessions[sessions.length - 1];
-      if (lastSession.results) {
-        const resultIdx = lastSession.results.findIndex(r => r.imageId === imageId);
-        if (resultIdx >= 0) {
-          lastSession.results[resultIdx].feedback = feedback;
-          // Tüm listeyi güncelle
-          await redis.del(SESSIONS_KEY);
-          for (const session of sessions) {
-            await redis.rpush(SESSIONS_KEY, JSON.stringify(session));
-          }
-          updated = true;
-        }
+    const session = sessions.find(s => s.sessionId === sessionId);
+    if (session) {
+      session.sessionFeedback = sessionFeedback || null;
+      
+      await redis.del(SESSIONS_KEY);
+      for (const s of sessions) {
+        await redis.rpush(SESSIONS_KEY, JSON.stringify(s));
       }
+      updated = true;
     }
 
     return res.status(updated ? 200 : 404).json({
       ok: updated,
-      message: updated ? "Feedback kaydedildi" : "Görsel bulunamadı",
+      message: updated ? "Feedback kaydedildi" : "Oturum bulunamadı",
     });
   }
 

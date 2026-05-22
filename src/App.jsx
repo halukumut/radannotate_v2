@@ -87,6 +87,30 @@ function bestIou(physicianBoxes, gtYoloBoxes) {
   return +best.toFixed(4);
 }
 
+// Calculate aggregated session statistics from results
+function buildSessionStats(results) {
+  const times = results.map(r => r.time);
+  const ious = results.map(r => r.iou).filter(v => v != null);
+  const correct = results.filter(r => r.labelCorrect).length;
+  const total = times.reduce((a, b) => a + b, 0);
+  const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+
+  return {
+    imageCount: results.length,
+    correctCount: correct,
+    accuracyRate: +(correct / results.length).toFixed(4),
+    totalTimeMs: total,
+    avgTimeMs: times.length ? +avg(times).toFixed(1) : null,
+    minTimeMs: times.length ? Math.min(...times) : null,
+    maxTimeMs: times.length ? Math.max(...times) : null,
+    avgIou: ious.length ? +avg(ious).toFixed(4) : null,
+    minIou: ious.length ? +Math.min(...ious).toFixed(4) : null,
+    maxIou: ious.length ? +Math.max(...ious).toFixed(4) : null,
+    annotatedImages: results.filter(r => r.boxes?.length > 0).length,
+    emptyImages: results.filter(r => !r.boxes?.length).length,
+  };
+}
+
 function formatTime(ms) {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
@@ -400,6 +424,42 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
   />;
 }
 
+// ── Physician Name Input Modal ────────────────────────────────────────────
+function NameInputModal({onStart}){
+  const [name,setName]=useState("");
+  const [error,setError]=useState("");
+
+  const handleSubmit=()=>{
+    const trimmed=name.trim();
+    if(!trimmed){setError("Lütfen adınızı girin");return;}
+    if(trimmed.length<2){setError("Ad en az 2 karakter olmalı");return;}
+    onStart(trimmed);
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:28,maxWidth:360,boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:8}}>Adınızı Girin</div>
+        <div style={{fontSize:13,color:C.textMuted,marginBottom:16}}>Bu oturum için doktor adınızı yazın</div>
+        <input
+          type="text"
+          value={name}
+          onChange={(e)=>{setName(e.target.value);setError("");}}
+          placeholder="Örn: Dr. Ahmet"
+          autoFocus
+          onKeyPress={(e)=>e.key==="Enter"&&handleSubmit()}
+          style={{width:"100%",padding:10,borderRadius:6,border:`1px solid ${C.border}`,background:C.bg,color:C.text,fontSize:13,marginBottom:8,outline:"none",boxSizing:"border-box"}}
+        />
+        {error&&<div style={{fontSize:12,color:C.danger,marginBottom:12}}>{error}</div>}
+        <button onClick={handleSubmit}
+          style={{width:"100%",padding:10,background:C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+          Başla
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Pred bbox paneli ──────────────────────────────────────────────────────
 function PredPanel({pred}){
   if(!pred?.length) return (
@@ -678,7 +738,7 @@ function ComparisonView({result,sessionImgs,onBack,onFeedbackSubmit}){
 }
 
 // ── Rapor ─────────────────────────────────────────────────────────────────
-function ReportView({results,mode,onReset,sessionImgs}){
+function ReportView({results,mode,onReset,sessionImgs,physicianId,onStartOther}){
   const avg=(arr)=>arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;
   const times=results.map(r=>r.time);
   const ious=results.map(r=>r.iou).filter(v=>v!==null);
@@ -690,12 +750,18 @@ function ReportView({results,mode,onReset,sessionImgs}){
 
   const [saveStatus,setSaveStatus]=useState("pending");
   const [savedUrl,setSavedUrl]=useState(null);
-  const [selectedResult,setSelectedResult]=useState(null);
-  const [resultsWithFeedback,setResultsWithFeedback]=useState(results);
+  const [sessionFeedback,setSessionFeedback]=useState("");
 
   useEffect(()=>{
     setSaveStatus("saving");
-    const payload={sessionId:`session_${Date.now()}`,mode,physicianId:"demo-user",completedAt:new Date().toISOString(),results:resultsWithFeedback};
+    const stats=buildSessionStats(results);
+    const payload={
+      physicianId:physicianId||"anonymous",
+      mode:mode,
+      completedAt:new Date().toISOString(),
+      stats:stats,
+      sessionFeedback:sessionFeedback.trim()||null
+    };
     fetch("/api/stats",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
       .then(r=>r.json())
       .then(d=>setSaveStatus(d.ok?"saved":"error"))
@@ -704,25 +770,7 @@ function ReportView({results,mode,onReset,sessionImgs}){
         setSavedUrl(URL.createObjectURL(blob));
         setSaveStatus("download");
       });
-  },[]); // eslint-disable-line
-
-  const handleFeedbackSubmit=(imageId,feedback)=>{
-    setResultsWithFeedback(prev=>prev.map(r=>r.imageId===imageId?{...r,feedback}:r));
-    // Optionally, send to server immediately
-    const result=resultsWithFeedback.find(r=>r.imageId===imageId);
-    if(result){
-      const updated={...result,feedback};
-      fetch(`/api/stats?update=${result.imageId}`,{
-        method:"PATCH",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({feedback})
-      }).catch(()=>{}); // Silent fail if offline
-    }
-  };
-
-  if(selectedResult){
-    return <ComparisonView result={selectedResult} sessionImgs={sessionImgs} onBack={()=>setSelectedResult(null)} onFeedbackSubmit={handleFeedbackSubmit}/>;
-  }
+  },[]);
 
   const iouColor=avgIou>0.7?C.success:avgIou>0.5?C.warning:C.danger;
   const accColor=accuracy>0.8?C.success:accuracy>0.6?C.warning:C.danger;
@@ -761,29 +809,7 @@ function ReportView({results,mode,onReset,sessionImgs}){
         ))}
       </div>
 
-      {/* Görsel tablo */}
-      <div style={{marginBottom:20}}>
-        <div style={{fontSize:12,fontWeight:600,color:C.textMuted,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.06em"}}>Görsel Bazlı Sonuçlar</div>
-        <div style={{display:"flex",flexDirection:"column",gap:5}}>
-          {resultsWithFeedback.map((r,i)=>(
-            <div key={i} 
-              onClick={()=>setSelectedResult(r)}
-              style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px 12px",display:"grid",gridTemplateColumns:"26px 1fr 68px 80px 88px 40px",alignItems:"center",gap:8,cursor:"pointer",transition:"all 0.2s"}}
-              onMouseEnter={(e)=>e.currentTarget.style.borderColor=C.accent+"88"}
-              onMouseLeave={(e)=>e.currentTarget.style.borderColor=C.border}
-            >
-              <span style={{fontSize:11,color:C.textDim,fontFamily:"monospace"}}>#{String(i+1).padStart(2,"0")}</span>
-              <div style={{fontSize:11,color:C.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.stem}</div>
-              <div style={{textAlign:"right",fontSize:12,color:C.accent,fontFamily:"monospace"}}>{formatTime(r.time)}</div>
-              <div style={{textAlign:"right",fontSize:12,fontFamily:"monospace",color:r.iou!==null?(r.iou>0.5?C.success:C.danger):C.textDim}}>
-                {r.iou!==null?`${r.iou.toFixed(2)} IoU`:"— boş"}
-              </div>
-              <div style={{textAlign:"right"}}><Badge color={r.labelCorrect?C.success:C.danger}>{r.labelCorrect?"DOĞRU":"YANLIŞ"}</Badge></div>
-              <div style={{textAlign:"right",fontSize:11,color:r.feedback?C.success:C.textDim}}>{r.feedback?"📝":"—"}</div>
-            </div>
-          ))}
-        </div>
-      </div>
+
 
       {/* Süre bar */}
       <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:12,padding:14,marginBottom:18}}>
@@ -798,9 +824,45 @@ function ReportView({results,mode,onReset,sessionImgs}){
         </div>
       </div>
 
-      <button onClick={onReset} style={{width:"100%",padding:12,background:C.accentSoft,border:`1px solid ${C.accent}44`,borderRadius:8,color:C.accent,fontSize:14,fontWeight:600,cursor:"pointer"}}>
-        Yeni Oturum Başlat
-      </button>
+      {/* Session Feedback */}
+      <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:14,marginBottom:14}}>
+        <label style={{display:"block",fontSize:12,fontWeight:600,color:C.text,marginBottom:10}}>
+          Oturum Geri Bildirimi / Notlar
+        </label>
+        <textarea
+          value={sessionFeedback}
+          onChange={(e)=>setSessionFeedback(e.target.value)}
+          placeholder="Bu oturum hakkında genel notlarınız..."
+          style={{
+            width:"100%",
+            minHeight:80,
+            padding:10,
+            borderRadius:6,
+            border:`1px solid ${C.border}`,
+            background:C.bg,
+            color:C.text,
+            fontFamily:"'DM Sans', sans-serif",
+            fontSize:12,
+            resize:"vertical",
+            outline:"none"
+          }}
+          onFocus={(e)=>e.target.style.borderColor=C.accent}
+          onBlur={(e)=>e.target.style.borderColor=C.border}
+        />
+        <div style={{fontSize:11,color:C.textMuted,marginTop:8}}>
+          {sessionFeedback.length} karakter
+        </div>
+      </div>
+
+      {/* Buttons */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <button onClick={onReset} style={{padding:12,background:C.accentSoft,border:`1px solid ${C.accent}44`,borderRadius:8,color:C.accent,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+          Anasayfaya Dön
+        </button>
+        <button onClick={onStartOther} style={{padding:12,background:mode==="solo"?C.ai:C.physician,border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+          {mode==="solo"?"🤖 AI Oturumu Başla":"👁 Solo Oturumu Başla"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -819,6 +881,9 @@ export default function App(){
   const [startTime,setStartTime]= useState(null);
   const [showGt,   setShowGt]   = useState(false);
   const [showPred, setShowPred] = useState(true);
+  const [physicianId, setPhysicianId] = useState(null);
+  const [showNameModal, setShowNameModal] = useState(false);
+  const [pendingMode, setPendingMode] = useState(null);
 
   // Image cache for pre-loading
   const imageCache = useImageCache(sessionImgs, imgIdx);
@@ -845,13 +910,39 @@ export default function App(){
 
   const startSession=(m)=>{
     if (!manifest) return;
-    // Solo → Set A, AI destekli → Set B
+    // Show name modal instead of starting directly
+    setPendingMode(m);
+    setShowNameModal(true);
+  };
+
+  const handleNameSubmit=(name)=>{
+    if (!manifest || !pendingMode) return;
+    setPhysicianId(name);
+    setShowNameModal(false);
+    startSessionWithMode(pendingMode);
+    setPendingMode(null);
+  };
+
+  const startSessionWithMode=(m)=>{
+    if (!manifest) return;
     const targetSet = m === "solo" ? "A" : "B";
     const sessionImages = manifest.images.filter(img => img.setId === targetSet);
     setSessionImgs(sessionImages);
-    setMode(m); setImgIdx(0); setResults([]); setBoxes([]); setSelIdx(null);
-    setStartTime(Date.now()); setShowGt(false); setShowPred(m==="ai");
+    setMode(m); 
+    setImgIdx(0); 
+    setResults([]); 
+    setBoxes([]); 
+    setSelIdx(null);
+    setStartTime(Date.now()); 
+    setShowGt(false); 
+    setShowPred(m==="ai");
     setPhase("session");
+  };
+
+  const startOtherSession=()=>{
+    if (!manifest || !physicianId) return;
+    const nextMode = mode === "solo" ? "ai" : "solo";
+    startSessionWithMode(nextMode);
   };
 
   const submit=()=>{
@@ -893,10 +984,11 @@ export default function App(){
     }
   };
 
-  const reset=()=>{setPhase("home");setMode(null);setImgIdx(0);setResults([]);setBoxes([]);setSelIdx(null);setSessionImgs([]);};
+  const reset=()=>{setPhase("home");setMode(null);setPhysicianId(null);setImgIdx(0);setResults([]);setBoxes([]);setSelIdx(null);setSessionImgs([]);setPendingMode(null);};
 
   return (
     <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'DM Sans','Segoe UI',sans-serif",paddingBottom:48}}>
+      {showNameModal && <NameInputModal onStart={handleNameSubmit} />}
 
       {/* Header */}
       <div style={{borderBottom:`1px solid ${C.border}`,padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:C.surface,position:"sticky",top:0,zIndex:10}}>
@@ -1056,7 +1148,7 @@ export default function App(){
           </div>
         )}
 
-        {phase==="report"&&<ReportView results={results} mode={mode} onReset={reset} sessionImgs={sessionImgs}/>}
+        {phase==="report"&&<ReportView results={results} mode={mode} onReset={reset} sessionImgs={sessionImgs} physicianId={physicianId} onStartOther={startOtherSession}/>}
       </div>
     </div>
   );
