@@ -124,8 +124,8 @@ function confColor(conf) {
 // ── Canvas bbox handle sabitleri ──────────────────────────────────────────
 const HR = 6;
 
-function getHandles(b, W, H) {
-  const bx = b.x * W, by = b.y * H, bw = b.w * W, bh = b.h * H;
+function getHandles(b, ox, oy, W, H) {
+  const bx = ox + b.x * W, by = oy + b.y * H, bw = b.w * W, bh = b.h * H;
   return [
     { id:"tl", cx:bx,          cy:by,          cursor:"nwse-resize" },
     { id:"tm", cx:bx+bw/2,     cy:by,          cursor:"ns-resize"   },
@@ -150,7 +150,7 @@ function applyResize(b, hid, dx, dy) {
 }
 
 function hitHandle(b,px,py,W,H){
-  for(const h of getHandles(b,W,H))
+  for(const h of getHandles(b,0,0,W,H))
     if(Math.abs(px-h.cx)<=HR+2 && Math.abs(py-h.cy)<=HR+2) return h;
   return null;
 }
@@ -177,7 +177,7 @@ function Stat({label,value,sub,color=C.text}){
 }
 
 // ── AnnotationCanvas ──────────────────────────────────────────────────────
-function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx,showGt,showPred}){
+function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx,showGt,showPred,aiMode}){
   const ASPECT_RATIO = 700 / 900; // width/height ratio (wider box for portrait images)
   const [canvasSize, setCanvasSize] = useState({w:700,h:900});
   const canvasRef = useRef(null);
@@ -188,6 +188,9 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
   const boxesRef  = useRef(boxes);
   const selRef    = useRef(selectedIdx);
   const canvasSizeRef = useRef(canvasSize);
+  // Keep pred boxes accessible in event handlers without stale closure
+  const predBoxesRef = useRef(imageData?.pred??[]);
+  useEffect(()=>{predBoxesRef.current=imageData?.pred??[];},[imageData?.pred]);
   useEffect(()=>{canvasSizeRef.current=canvasSize;},[canvasSize]);
   useEffect(()=>{boxesRef.current=boxes;},[boxes]);
   useEffect(()=>{selRef.current=selectedIdx;},[selectedIdx]);
@@ -306,15 +309,19 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
       });
     }
 
-    // Hekim bbox'ları
+    // Hekim bbox'ları (AI oturumda: source="ai" → mor kesik, source="edited"/"physician" → turuncu düz)
     boxesRef.current.forEach((b,i)=>{
       const sel=i===selRef.current;
-      drawBox(b, C.physician, null,
-        boxesRef.current.length>1?`#${i+1}`:"Hekim",
-        sel?1:0.8);
+      const isAiSource = b.source === "ai";
+      const color = isAiSource ? C.ai : C.physician;
+      const dash  = isAiSource ? [6,3] : null;
+      let label;
+      if(boxesRef.current.length>1) label=isAiSource?`AI #${i+1}`:`#${i+1}`;
+      else label=isAiSource?"AI (onaylandı)":"Hekim";
+      drawBox(b, color, dash, label, sel?1:0.82);
       if(sel){
-        getHandles(b,w,h).forEach(hd=>{
-          ctx.fillStyle=C.physician; ctx.strokeStyle="#060810"; ctx.lineWidth=1.5;
+        getHandles(b,ox,oy,displayW,displayH).forEach(hd=>{
+          ctx.fillStyle=color; ctx.strokeStyle="#060810"; ctx.lineWidth=1.5;
           ctx.beginPath(); ctx.rect(hd.cx-HR,hd.cy-HR,HR*2,HR*2); ctx.fill(); ctx.stroke();
         });
       }
@@ -354,12 +361,19 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
     }
     for(let i=bxs.length-1;i>=0;i--)
       if(hitBox(bxs[i],px-ox,py-oy,displayW,displayH)) return "move";
+    // Also show pointer over pred boxes (clickable to import)
+    if(predBoxesRef.current?.length){
+      for(const pb of predBoxesRef.current){
+        const r=yoloToRect(pb);
+        if(hitBox(r,px-ox,py-oy,displayW,displayH)) return "pointer";
+      }
+    }
     return "crosshair";
   };
 
   const onDown=(e)=>{
     if(!imageData) return;
-    e.preventDefault(); canvasRef.current?.focus();
+    e.preventDefault();
     const {px,py,nx,ny}=getPos(e);
     const {ox, oy, w: displayW, h: displayH} = displayDimsRef.current;
     const bxs=boxesRef.current; const sel=selRef.current;
@@ -370,6 +384,7 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
       if(hd){inter.mode="resize";inter.startPx=px;inter.startPy=py;inter.origBox={...bxs[sel]};inter.handleId=hd.id;return;}
       if(hitBox(bxs[sel],px-ox,py-oy,displayW,displayH)){inter.mode="move";inter.startPx=px;inter.startPy=py;inter.origBox={...bxs[sel]};return;}
     }
+    // Hit test existing editable boxes
     for(let i=bxs.length-1;i>=0;i--){
       if(hitBox(bxs[i],px-ox,py-oy,displayW,displayH)){
         onSelectIdx(i); selRef.current=i;
@@ -391,12 +406,16 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
       const dx=(px-inter.startPx)/displayW, dy=(py-inter.startPy)/displayH;
       const sel=selRef.current; if(sel===null) return;
       const ob=inter.origBox;
-      onBoxesChange(boxesRef.current.map((b,i)=>i===sel?{...b,x:Math.max(0,Math.min(1-ob.w,ob.x+dx)),y:Math.max(0,Math.min(1-ob.h,ob.y+dy))}:b));
+      onBoxesChange(boxesRef.current.map((b,i)=>i===sel
+        ?{...b,source:"edited",x:Math.max(0,Math.min(1-ob.w,ob.x+dx)),y:Math.max(0,Math.min(1-ob.h,ob.y+dy))}
+        :b));
     }
     else if(inter.mode==="resize"&&inter.origBox){
       const dx=(px-inter.startPx)/displayW, dy=(py-inter.startPy)/displayH;
       const sel=selRef.current; if(sel===null) return;
-      onBoxesChange(boxesRef.current.map((b,i)=>i===sel?applyResize(inter.origBox,inter.handleId,dx,dy):b));
+      onBoxesChange(boxesRef.current.map((b,i)=>i===sel
+        ?{...applyResize(inter.origBox,inter.handleId,dx,dy),source:"edited"}
+        :b));
     }
   };
 
@@ -408,7 +427,7 @@ function AnnotationCanvas({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx
       const x=Math.min(ds.x,nx), y=Math.min(ds.y,ny);
       const bw=Math.abs(nx-ds.x), bh=Math.abs(ny-ds.y);
       if(bw>0.02&&bh>0.02){
-        const nb=[...boxesRef.current,{id:Date.now(),x,y,w:bw,h:bh}];
+        const nb=[...boxesRef.current,{id:Date.now(),x,y,w:bw,h:bh,source:"physician"}];
         onBoxesChange(nb); onSelectIdx(nb.length-1);
       }
     }
@@ -923,6 +942,17 @@ export default function App(){
     setPendingMode(null);
   };
 
+  // Convert pred YOLO boxes to editable canvas boxes with source="ai"
+  const predToBoxes=(pred)=>(pred??[]).map((pb,i)=>({
+    id: Date.now()+i,
+    x: pb.cx - pb.w/2,
+    y: pb.cy - pb.h/2,
+    w: pb.w,
+    h: pb.h,
+    source: "ai",
+    conf: pb.conf,
+  }));
+
   const startSessionWithMode=(m)=>{
     if (!manifest) return;
     const targetSet = m === "solo" ? "A" : "B";
@@ -931,7 +961,8 @@ export default function App(){
     setMode(m); 
     setImgIdx(0); 
     setResults([]); 
-    setBoxes([]); 
+    // For AI mode: pre-populate first image's boxes with pred boxes
+    setBoxes(m==="ai" ? predToBoxes(sessionImages[0]?.pred) : []); 
     setSelIdx(null);
     setStartTime(Date.now()); 
     setShowGt(false); 
@@ -951,17 +982,19 @@ export default function App(){
     const iouScore=bestIou(boxes,gtBoxes);
     const hasGt=gtBoxes.length>0;
 
-    // 4 durum doğruluk mantığı:
-    // GT var  + hekim işaretledi → IoU > 0.3 ise doğru
-    // GT var  + hekim boş bıraktı → yanlış (kaçırdı)
-    // GT yok  + hekim boş bıraktı → doğru (true negative)
-    // GT yok  + hekim işaretledi → yanlış (false positive)
     let labelCorrect;
     if (hasGt) {
       labelCorrect = boxes.length > 0 && iouScore !== null && iouScore > 0.3;
     } else {
       labelCorrect = boxes.length === 0;
     }
+
+    // AI interaction breakdown
+    const aiAccepted   = boxes.filter(b=>b.source==="ai").length;
+    const aiEdited     = boxes.filter(b=>b.source==="edited").length;
+    const physicianNew = boxes.filter(b=>b.source==="physician").length;
+    const predTotal    = imageData?.pred?.length??0;
+    const aiDeleted    = Math.max(0, predTotal - aiAccepted - aiEdited);
 
     const rec={
       stem:imageData?.stem,
@@ -973,13 +1006,28 @@ export default function App(){
       labelCorrect,
       iou:iouScore,
       time:elapsed,
-      boxes:boxes.map(b=>({x:+b.x.toFixed(4),y:+b.y.toFixed(4),w:+b.w.toFixed(4),h:+b.h.toFixed(4)})),
+      boxes:boxes.map(b=>({
+        x:+b.x.toFixed(4),y:+b.y.toFixed(4),
+        w:+b.w.toFixed(4),h:+b.h.toFixed(4),
+        source:b.source??"physician",
+        ...(b.conf!=null?{conf:b.conf}:{}),
+      })),
+      ...(mode==="ai"?{aiInteraction:{
+        predCount:predTotal,
+        accepted:aiAccepted,
+        edited:aiEdited,
+        deleted:aiDeleted,
+        physicianAdded:physicianNew,
+      }}:{}),
     };
     const newResults=[...results,rec];
     setResults(newResults);
     if(imgIdx+1>=sessionImgs.length){setPhase("report");}
     else{
-      setImgIdx(i=>i+1); setBoxes([]); setSelIdx(null);
+      const nextIdx=imgIdx+1;
+      setImgIdx(nextIdx);
+      setSelIdx(null);
+      setBoxes(mode==="ai" ? predToBoxes(sessionImgs[nextIdx]?.pred) : []);
       setStartTime(Date.now()); setShowGt(false); setShowPred(mode==="ai");
     }
   };
@@ -1103,19 +1151,30 @@ export default function App(){
             <AnnotationCanvas
               imageData={imageData} boxes={boxes} selectedIdx={selIdx}
               onBoxesChange={setBoxes} onSelectIdx={setSelIdx}
-              showGt={showGt} showPred={mode==="ai"&&showPred}
+              showGt={showGt} showPred={false}
+              aiMode={mode==="ai"}
             />
 
             {/* Araç çubuğu */}
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:8,flexWrap:"wrap",gap:6}}>
               <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
-                {boxes.map((_,i)=>(
-                  <button key={i} onClick={()=>setSelIdx(selIdx===i?null:i)}
-                    style={{padding:"3px 9px",borderRadius:5,border:`1px solid ${selIdx===i?C.physician:C.border}`,background:selIdx===i?C.physicianSoft:"transparent",color:selIdx===i?C.physician:C.textMuted,fontSize:11,cursor:"pointer",fontFamily:"monospace"}}>
-                    #{i+1}
-                  </button>
-                ))}
-                {!boxes.length&&<span style={{fontSize:11,color:C.textDim}}>Bbox yok</span>}
+                {boxes.map((b,i)=>{
+                  const isAi=b.source==="ai"||b.source==="edited";
+                  const col=isAi?C.ai:C.physician;
+                  return (
+                    <button key={i} onClick={()=>setSelIdx(selIdx===i?null:i)}
+                      style={{padding:"3px 9px",borderRadius:5,
+                        border:`1px solid ${selIdx===i?col:C.border}`,
+                        background:selIdx===i?(isAi?C.aiSoft:C.physicianSoft):"transparent",
+                        color:selIdx===i?col:C.textMuted,
+                        fontSize:11,cursor:"pointer",fontFamily:"monospace"}}>
+                      {isAi?"AI":"●"} #{i+1}
+                    </button>
+                  );
+                })}
+                {!boxes.length&&<span style={{fontSize:11,color:C.textDim}}>
+                  {mode==="ai"?"AI tahmini yok":"Bbox yok"}
+                </span>}
               </div>
               <div style={{display:"flex",gap:6}}>
                 {selIdx!==null&&(
@@ -1130,7 +1189,6 @@ export default function App(){
                     Tümünü Sil
                   </button>
                 )}
-
               </div>
             </div>
 
@@ -1140,9 +1198,18 @@ export default function App(){
 
             <div style={{display:"flex",alignItems:"center",justifyContent:"flex-start",marginTop:14}}>
               <div style={{fontSize:12,color:C.textMuted}}>
-                {boxes.length===0
-                  ?<span>Patoloji yoksa boş bırakabilirsiniz</span>
-                  :<span style={{color:C.success}}>✓ {boxes.length} bbox — ilerleyebilirsiniz</span>}
+                {mode==="ai"
+                  ? boxes.length===0
+                    ? <span>AI tahmini yok — boş bırakabilir veya yeni bbox çizebilirsiniz</span>
+                    : <span style={{color:C.success}}>
+                        ✓ {boxes.filter(b=>b.source==="ai").length} AI onaylandı
+                        {boxes.filter(b=>b.source==="edited").length>0&&` · ${boxes.filter(b=>b.source==="edited").length} düzenlendi`}
+                        {boxes.filter(b=>b.source==="physician").length>0&&` · ${boxes.filter(b=>b.source==="physician").length} yeni eklendi`}
+                      </span>
+                  : boxes.length===0
+                    ? <span>Patoloji yoksa boş bırakabilirsiniz</span>
+                    : <span style={{color:C.success}}>✓ {boxes.length} bbox — ilerleyebilirsiniz</span>
+                }
               </div>
             </div>
           </div>
