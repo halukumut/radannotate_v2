@@ -479,6 +479,462 @@ function NameInputModal({onStart}){
   );
 }
 
+// ── Session Instruction Modal ────────────────────────────────────────────
+function SessionInstructionModal({mode,onAcknowledge}){
+  const instructions={
+    solo:{
+      title:"Oturum A — Solo Anotasyon",
+      description:"AI yardımı olmadan bağımsız olarak tıbbi görüntüleri etiketleyin.",
+      steps:[
+        "📌 Kutucuk çizmek için görsele tıklayıp sürükleyin",
+        "✏️ Kutucukları düzenlemek için köşe ve kenarları ayarlayın",
+        "🗑️ Kutucukları silmek için seçtikten sonra Delete tuşuna basın",
+        "⚫ Patoloji yoksa boş bırakabilirsiniz",
+      ],
+      tips:"Görseli daha iyi görmek için sağ üstteki tam ekran simgesini kullanabilirsiniz."
+    },
+    ai:{
+      title:"Oturum B — AI Destekli Anotasyon",
+      description:"Model tarafından önerilen kutucukları gözden geçirin ve düzenleyin.",
+      steps:[
+        "🤖 Model önerisi AI kutucukları otomatik gösterilir",
+        "✅ Öneriyle aynı kalması için hiçbir şey yapmayın",
+        "📌 Kutucuk çizmek için görsele tıklayıp sürükleyin",
+        "✏️ Kutucukları düzenlemek için köşe ve kenarları ayarlayın",
+        "🗑️ Kutucukları silmek için seçtikten sonra Delete tuşuna basın",
+        "⚠️ Hiçbir işlem yapmazsanız, AI önerisi kabul edilir"
+      ],
+      tips:"Görseli daha iyi görmek için sağ üstteki tam ekran simgesini kullanabilirsiniz."
+    }
+  };
+
+  const inst=instructions[mode]||instructions.solo;
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,padding:32,maxWidth:520,boxShadow:"0 20px 80px rgba(0,0,0,0.6)",maxHeight:"90vh",overflow:"auto"}}>
+        <div style={{fontSize:11,color:mode==="ai"?C.ai:C.physician,textTransform:"uppercase",letterSpacing:"0.08em",fontWeight:700,marginBottom:8}}>
+          {mode==="ai"?"🤖 AI Destekli":"👁 Solo"} Mod
+        </div>
+        <div style={{fontSize:22,fontWeight:800,color:C.text,marginBottom:8}}>{inst.title}</div>
+        <div style={{fontSize:14,color:C.textMuted,lineHeight:1.6,marginBottom:20}}>{inst.description}</div>
+
+        <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:16,marginBottom:20}}>
+          <div style={{fontSize:12,fontWeight:700,color:C.text,marginBottom:12,textTransform:"uppercase",letterSpacing:"0.04em"}}>Nasıl Kullanacağım?</div>
+          {inst.steps.map((step,i)=>(
+            <div key={i} style={{fontSize:13,color:C.text,lineHeight:1.7,marginBottom:8,display:"flex",gap:10}}>
+              <span style={{minWidth:24,fontSize:12}}>{step}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{background:C.accentSoft,border:`1px solid ${C.accent}44`,borderRadius:10,padding:12,marginBottom:20}}>
+          <div style={{fontSize:12,color:C.accent,fontWeight:600}}>💡 İpucu</div>
+          <div style={{fontSize:12,color:C.accent,lineHeight:1.6,marginTop:6}}>{inst.tips}</div>
+        </div>
+
+        <button onClick={onAcknowledge}
+          style={{width:"100%",padding:12,background:C.accent,color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:"pointer",transition:"opacity 0.2s"}}>
+          Anladım, Başlayalım
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Fullscreen Image Viewer (Zoom + Pan) with full bbox editing ──────────
+function FullscreenViewer({imageData,boxes,selectedIdx,onBoxesChange,onSelectIdx,showGt,showPred,onShowPredToggle,aiMode,mode,imgIdx,sessionLength,onSubmit,onClose}){
+  const [zoom,setZoom]=useState(1);
+  const [pan,setPan]=useState({x:0,y:0});
+  const canvasRef=useRef(null);
+  const imgRef=useRef(null);
+  const imgDimsRef=useRef({w:1,h:1});
+  const boxesRef=useRef(boxes);
+  const selRef=useRef(selectedIdx);
+  const predBoxesRef=useRef(imageData?.pred??[]);
+  const panStartRef=useRef(null);
+  const interRef=useRef({mode:"idle"});
+  const zoomRef=useRef(zoom);
+  const HR=6;
+
+  useEffect(()=>{zoomRef.current=zoom;},[zoom]);
+  useEffect(()=>{predBoxesRef.current=imageData?.pred??[];},[imageData?.pred]);
+  useEffect(()=>{boxesRef.current=boxes;},[boxes]);
+  useEffect(()=>{selRef.current=selectedIdx;},[selectedIdx]);
+
+  // Load image
+  useEffect(()=>{
+    imgRef.current=null;
+    if(!imageData?.url) return;
+    const img=new Image();
+    img.onload=()=>{imgRef.current=img;draw();};
+    img.onerror=()=>{imgRef.current=null;draw();};
+    img.src=imageData.url;
+  },[imageData?.url]);
+
+  // Store original image dimensions
+  useEffect(()=>{
+    if(!imgRef.current) return;
+    const iw=imgRef.current.naturalWidth||imgRef.current.width;
+    const ih=imgRef.current.naturalHeight||imgRef.current.height;
+    if(iw>0&&ih>0) imgDimsRef.current={w:iw,h:ih};
+  },[imageData?.url]);
+
+  // Keyboard shortcuts
+  useEffect(()=>{
+    const onKey=(e)=>{
+      if(e.key==="Escape") onClose();
+      else if(e.key==="+" || e.key==="=") setZoom(z=>Math.min(3,z+0.2));
+      else if(e.key==="-") setZoom(z=>Math.max(1,z-0.2));
+      else if(e.key==="0") setZoom(1);
+      else if((e.key==="Delete"||e.key==="Backspace")&&selRef.current!==null){
+        onBoxesChange(boxesRef.current.filter((_,i)=>i!==selRef.current));
+        onSelectIdx(null);
+      }
+    };
+    window.addEventListener("keydown",onKey);
+    return ()=>window.removeEventListener("keydown",onKey);
+  },[onBoxesChange,onSelectIdx,onClose]);
+
+  const getHandles=(b,ox,oy,W,H)=>{
+    const bx=ox+b.x*W,by=oy+b.y*H,bw=b.w*W,bh=b.h*H;
+    return [
+      {id:"tl",cx:bx,cy:by,cursor:"nwse-resize"},
+      {id:"tm",cx:bx+bw/2,cy:by,cursor:"ns-resize"},
+      {id:"tr",cx:bx+bw,cy:by,cursor:"nesw-resize"},
+      {id:"ml",cx:bx,cy:by+bh/2,cursor:"ew-resize"},
+      {id:"mr",cx:bx+bw,cy:by+bh/2,cursor:"ew-resize"},
+      {id:"bl",cx:bx,cy:by+bh,cursor:"nesw-resize"},
+      {id:"bm",cx:bx+bw/2,cy:by+bh,cursor:"ns-resize"},
+      {id:"br",cx:bx+bw,cy:by+bh,cursor:"nwse-resize"},
+    ];
+  };
+
+  const applyResize=(b,hid,dx,dy)=>{
+    let {x,y,w,h}=b;
+    if(hid.includes("l")){x+=dx;w-=dx;}if(hid.includes("r")){w+=dx;}
+    if(hid.includes("t")){y+=dy;h-=dy;}if(hid.includes("b")){h+=dy;}
+    if(w<0.01){if(hid.includes("l"))x=b.x+b.w-0.01;w=0.01;}
+    if(h<0.01){if(hid.includes("t"))y=b.y+b.h-0.01;h=0.01;}
+    x=Math.max(0,x);y=Math.max(0,y);
+    w=Math.min(1-x,w);h=Math.min(1-y,h);
+    return {...b,x,y,w,h};
+  };
+
+  const hitHandle=(b,px,py,W,H)=>{
+    for(const h of getHandles(b,0,0,W,H))
+      if(Math.abs(px-h.cx)<=HR+2&&Math.abs(py-h.cy)<=HR+2) return h;
+    return null;
+  };
+
+  const hitBox=(b,px,py,W,H)=>{
+    return px>=b.x*W&&px<=(b.x+b.w)*W&&py>=b.y*H&&py<=(b.y+b.h)*H;
+  };
+
+  const getPos=(e,ox,oy,displayW,displayH)=>{
+    const canvas=canvasRef.current;
+    const rect=canvas.getBoundingClientRect();
+    const px=e.clientX-rect.left,py=e.clientY-rect.top;
+    const nx=(px-ox)/displayW,ny=(py-oy)/displayH;
+    return {px,py,nx,ny};
+  };
+
+  const draw=useCallback(()=>{
+    const canvas=canvasRef.current;
+    if(!canvas) return;
+    const ctx=canvas.getContext("2d");
+    const W=window.innerWidth-32;
+    const H=window.innerHeight-120;
+    canvas.width=W;
+    canvas.height=H;
+
+    ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
+
+    // Grid
+    ctx.strokeStyle=C.border;ctx.lineWidth=0.5;ctx.globalAlpha=0.2;
+    for(let x=0;x<W;x+=32){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+    for(let y=0;y<H;y+=32){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+    ctx.globalAlpha=1;
+
+    if(imgRef.current){
+      const iw=imgDimsRef.current.w;
+      const ih=imgDimsRef.current.h;
+      const z=zoomRef.current;
+      const scale=Math.min(W/iw,H/ih)*z;
+      const displayW=Math.round(iw*scale);
+      const displayH=Math.round(ih*scale);
+      const baseX=(W-displayW)/2;
+      const baseY=(H-displayH)/2;
+      const ox=baseX+pan.x;
+      const oy=baseY+pan.y;
+      ctx.drawImage(imgRef.current,ox,oy,displayW,displayH);
+
+      const drawBox=(rect,color,dash,label,alpha=1)=>{
+        const px=ox+rect.x*displayW,py=oy+rect.y*displayH,pw=rect.w*displayW,ph=rect.h*displayH;
+        ctx.globalAlpha=alpha;
+        ctx.strokeStyle=color;ctx.lineWidth=2;
+        if(dash)ctx.setLineDash(dash);else ctx.setLineDash([]);
+        ctx.strokeRect(px,py,pw,ph);
+        ctx.fillStyle=color+"20";ctx.fillRect(px,py,pw,ph);
+        ctx.setLineDash([]);
+        if(label){
+          const tw=ctx.measureText(label).width+8;
+          ctx.fillStyle=color+"ee";
+          ctx.fillRect(px,py-16,tw,16);
+          ctx.fillStyle="#fff";ctx.font="bold 10px monospace";
+          ctx.fillText(label,px+4,py-4);
+        }
+        ctx.globalAlpha=1;
+      };
+
+      if(showGt&&imageData?.gt){
+        imageData.gt.forEach((gb,i)=>{
+          drawBox({x:gb.cx-gb.w/2,y:gb.cy-gb.h/2,w:gb.w,h:gb.h},C.gt,[5,4],imageData.gt.length>1?`GT #${i+1}`:"GT");
+        });
+      }
+
+      if(showPred&&imageData?.pred){
+        imageData.pred.forEach((pb,i)=>{
+          const conf=pb.conf??1;
+          const col=conf>=0.80?C.success:conf>=0.55?C.warning:C.danger;
+          drawBox({x:pb.cx-pb.w/2,y:pb.cy-pb.h/2,w:pb.w,h:pb.h},col,[8,4],`AI ${Math.round(conf*100)}%${imageData.pred.length>1?` #${i+1}`:""}`,0.9);
+        });
+      }
+
+      boxesRef.current.forEach((b,i)=>{
+        const sel=i===selRef.current;
+        const isAiSource=b.source==="ai";
+        const color=isAiSource?C.ai:C.physician;
+        const dash=isAiSource?[6,3]:null;
+        let label;
+        if(boxesRef.current.length>1)label=isAiSource?`AI #${i+1}`:`#${i+1}`;
+        else label=isAiSource?"AI":"Hekim";
+        drawBox(b,color,dash,label,sel?1:0.82);
+        if(sel){
+          getHandles(b,ox,oy,displayW,displayH).forEach(hd=>{
+            ctx.fillStyle=color;ctx.strokeStyle="#060810";ctx.lineWidth=1.5;
+            ctx.beginPath();ctx.rect(hd.cx-HR,hd.cy-HR,HR*2,HR*2);ctx.fill();ctx.stroke();
+          });
+        }
+      });
+
+      // Draw preview
+      const inter=interRef.current;
+      if(inter.mode==="drawing"&&inter.drawStart&&inter.drawCurrent){
+        const ds=inter.drawStart,dc=inter.drawCurrent;
+        const x=Math.min(ds.x,dc.x),y=Math.min(ds.y,dc.y);
+        const bw=Math.abs(dc.x-ds.x),bh=Math.abs(dc.y-ds.y);
+        if(bw>0.005&&bh>0.005)drawBox({x,y,w:bw,h:bh},C.physician,[5,3],null);
+      }
+    }else{
+      ctx.fillStyle=C.textDim;ctx.font="16px monospace";ctx.textAlign="center";
+      ctx.fillText(imageData?.file??"Görsel bekleniyor…",W/2,H/2);
+    }
+  },[imageData,showGt,showPred]);
+
+  useEffect(()=>{draw();},[draw,boxes,selectedIdx,zoom,pan]);
+
+  const onCanvasMouseDown=(e)=>{
+    if(!imageData) return;
+    e.preventDefault();
+    canvasRef.current?.focus();
+    
+    const canvas=canvasRef.current;
+    const rect=canvas.getBoundingClientRect();
+    const W=rect.width,H=rect.height;
+    const iw=imgDimsRef.current.w,ih=imgDimsRef.current.h;
+    const z=zoomRef.current;
+    const scale=Math.min(W/iw,H/ih)*z;
+    const displayW=Math.round(iw*scale);
+    const displayH=Math.round(ih*scale);
+    const baseX=(W-displayW)/2;
+    const baseY=(H-displayH)/2;
+    const ox=baseX+pan.x;
+    const oy=baseY+pan.y;
+
+    if(zoom>1&&e.button===0){
+      panStartRef.current={x:e.clientX,y:e.clientY,startPan:{...pan}};
+      return;
+    }
+
+    const px=e.clientX-rect.left,py=e.clientY-rect.top;
+    const nx=(px-ox)/displayW,ny=(py-oy)/displayH;
+    const inter=interRef.current;
+    const bxs=boxesRef.current;
+    const sel=selRef.current;
+
+    if(sel!==null){
+      const hd=hitHandle(bxs[sel],px-ox,py-oy,displayW,displayH);
+      if(hd){inter.mode="resize";inter.startPx=px;inter.startPy=py;inter.origBox={...bxs[sel]};inter.handleId=hd.id;return;}
+      if(hitBox(bxs[sel],px-ox,py-oy,displayW,displayH)){inter.mode="move";inter.startPx=px;inter.startPy=py;inter.origBox={...bxs[sel]};return;}
+    }
+
+    for(let i=bxs.length-1;i>=0;i--){
+      if(hitBox(bxs[i],px-ox,py-oy,displayW,displayH)){
+        onSelectIdx(i);selRef.current=i;
+        inter.mode="move";inter.startPx=px;inter.startPy=py;inter.origBox={...bxs[i]};return;
+      }
+    }
+
+    onSelectIdx(null);selRef.current=null;
+    inter.mode="drawing";inter.drawStart={x:nx,y:ny};inter.drawCurrent={x:nx,y:ny};
+  };
+
+  const onCanvasMouseMove=(e)=>{
+    const canvas=canvasRef.current;
+    const rect=canvas.getBoundingClientRect();
+    const W=rect.width,H=rect.height;
+    const iw=imgDimsRef.current.w,ih=imgDimsRef.current.h;
+    const z=zoomRef.current;
+    const scale=Math.min(W/iw,H/ih)*z;
+    const displayW=Math.round(iw*scale);
+    const displayH=Math.round(ih*scale);
+    const baseX=(W-displayW)/2;
+    const baseY=(H-displayH)/2;
+    const ox=baseX+pan.x;
+    const oy=baseY+pan.y;
+
+    const px=e.clientX-rect.left,py=e.clientY-rect.top;
+    const nx=(px-ox)/displayW,ny=(py-oy)/displayH;
+    const inter=interRef.current;
+
+    if(panStartRef.current){
+      const dx=e.clientX-panStartRef.current.x;
+      const dy=e.clientY-panStartRef.current.y;
+      setPan({x:panStartRef.current.startPan.x+dx,y:panStartRef.current.startPan.y+dy});
+      return;
+    }
+
+    if(inter.mode==="drawing"){inter.drawCurrent={x:nx,y:ny};draw();}
+    else if(inter.mode==="move"&&inter.origBox){
+      const dx=(px-inter.startPx)/displayW,dy=(py-inter.startPy)/displayH;
+      const sel=selRef.current;if(sel===null)return;
+      const ob=inter.origBox;
+      onBoxesChange(boxesRef.current.map((b,i)=>i===sel?{...b,source:"edited",x:Math.max(0,Math.min(1-ob.w,ob.x+dx)),y:Math.max(0,Math.min(1-ob.h,ob.y+dy))}:b));
+    }
+    else if(inter.mode==="resize"&&inter.origBox){
+      const dx=(px-inter.startPx)/displayW,dy=(py-inter.startPy)/displayH;
+      const sel=selRef.current;if(sel===null)return;
+      onBoxesChange(boxesRef.current.map((b,i)=>i===sel?{...applyResize(inter.origBox,inter.handleId,dx,dy),source:"edited"}:b));
+    }
+  };
+
+  const onCanvasMouseUp=(e)=>{
+    const canvas=canvasRef.current;
+    const rect=canvas.getBoundingClientRect();
+    const W=rect.width,H=rect.height;
+    const iw=imgDimsRef.current.w,ih=imgDimsRef.current.h;
+    const z=zoomRef.current;
+    const scale=Math.min(W/iw,H/ih)*z;
+    const displayW=Math.round(iw*scale);
+    const displayH=Math.round(ih*scale);
+    const baseX=(W-displayW)/2;
+    const baseY=(H-displayH)/2;
+    const ox=baseX+pan.x;
+    const oy=baseY+pan.y;
+
+    const px=e.clientX-rect.left,py=e.clientY-rect.top;
+    const nx=(px-ox)/displayW,ny=(py-oy)/displayH;
+    const inter=interRef.current;
+
+    if(inter.mode==="drawing"&&inter.drawStart){
+      const ds=inter.drawStart;
+      const x=Math.min(ds.x,nx),y=Math.min(ds.y,ny);
+      const bw=Math.abs(nx-ds.x),bh=Math.abs(ny-ds.y);
+      if(bw>0.02&&bh>0.02){
+        const nb=[...boxesRef.current,{id:Date.now(),x,y,w:bw,h:bh,source:"physician"}];
+        onBoxesChange(nb);onSelectIdx(nb.length-1);
+      }
+    }
+
+    inter.mode="idle";inter.drawStart=null;inter.drawCurrent=null;inter.origBox=null;
+    panStartRef.current=null;
+    draw();
+  };
+
+  const onWheel=(e)=>{
+    if(!e.ctrlKey) return;
+    e.preventDefault();
+    const delta=e.deltaY>0?-0.15:0.15;
+    setZoom(z=>Math.max(1,Math.min(3,z+delta)));
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.95)",display:"flex",flexDirection:"column",zIndex:150}}>
+      {/* Top toolbar */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 16px",background:C.surface,borderBottom:`1px solid ${C.border}`}}>
+        <div style={{fontSize:13,color:C.textMuted}}>Tam Ekran · {imageData?.file||"Görsel"} · {imgIdx+1}/{sessionLength}</div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{fontSize:12,color:C.textMuted,fontFamily:"monospace"}}>{Math.round(zoom*100)}%</span>
+          <button onClick={()=>setZoom(1)} title="Ctrl+0" style={{padding:"4px 8px",borderRadius:4,border:`1px solid ${C.border}`,background:"transparent",color:C.text,fontSize:11,cursor:"pointer"}}>
+            Sıfırla
+          </button>
+          <button onClick={()=>setZoom(z=>Math.max(1,z-0.1))} title="Ctrl+-" style={{padding:"4px 8px",borderRadius:4,border:`1px solid ${C.border}`,background:"transparent",color:C.text,fontSize:11,cursor:"pointer"}}>
+            −
+          </button>
+          <button onClick={()=>setZoom(z=>Math.min(3,z+0.1))} title="Ctrl++" style={{padding:"4px 8px",borderRadius:4,border:`1px solid ${C.border}`,background:"transparent",color:C.text,fontSize:11,cursor:"pointer"}}>
+            +
+          </button>
+          <button onClick={onClose} style={{padding:"4px 10px",borderRadius:4,border:`1px solid ${C.border}`,background:"transparent",color:C.text,fontSize:11,cursor:"pointer"}}>
+            ✕ Çık
+          </button>
+        </div>
+      </div>
+
+      {/* Canvas with overlay panels */}
+      <div style={{flex:1,position:"relative",overflow:"hidden"}} onMouseDown={onCanvasMouseDown} onMouseMove={onCanvasMouseMove} onMouseUp={onCanvasMouseUp} onMouseLeave={onCanvasMouseUp} onWheel={onWheel}>
+        <canvas ref={canvasRef} style={{cursor:"crosshair",display:"block",width:"100%",height:"100%"}}/>
+        
+        {/* AI Predictions Panel (top left) - fades when zoomed */}
+        {aiMode&&imageData?.pred?.length>0&&(
+          <div style={{position:"absolute",top:12,left:12,background:C.aiSoft,border:`1px solid ${C.ai}33`,borderRadius:8,padding:"10px 12px",fontSize:11,maxWidth:200,transition:"opacity 0.3s",opacity:zoom>1.5?0.3:1}}>
+            <div style={{fontSize:10,color:C.ai,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6,fontWeight:700}}>AI Tahminleri</div>
+            {imageData.pred.map((pb,i)=>{
+              const conf=pb.conf??1;
+              const col=conf>=0.80?C.success:conf>=0.55?C.warning:C.danger;
+              const pct=Math.round(conf*100);
+              return (
+                <div key={i} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+                  <span style={{fontSize:10,color:C.textDim,fontFamily:"monospace",minWidth:16}}>#{i+1}</span>
+                  <div style={{flex:1,background:C.border,borderRadius:99,height:4,overflow:"hidden"}}>
+                    <div style={{width:`${pct}%`,height:"100%",background:col,borderRadius:99}}/>
+                  </div>
+                  <span style={{fontSize:9,fontWeight:600,color:col,fontFamily:"monospace"}}>%{pct}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {zoom>1&&<div style={{position:"absolute",bottom:16,left:16,fontSize:11,color:C.textMuted,background:C.surface,border:`1px solid ${C.border}`,borderRadius:6,padding:"8px 12px"}}>
+          Ctrl+Scroll: Zoom · Sürükle: Pan · Esc: Çık
+        </div>}
+      </div>
+
+      {/* Bottom toolbar */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",background:C.surface,borderTop:`1px solid ${C.border}`,gap:10}}>
+        <div style={{display:"flex",gap:8,alignItems:"center",flex:1}}>
+          {aiMode&&(
+            <button onClick={onShowPredToggle}
+              style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${C.ai}44`,background:showPred?C.aiSoft:"transparent",color:C.ai,fontSize:12,cursor:"pointer",fontWeight:500}}>
+              {showPred?"Pred Gizle":"Pred Göster"}
+            </button>
+          )}
+          <div style={{flex:1,maxWidth:300}}>
+            <div style={{background:C.border,borderRadius:99,height:6,overflow:"hidden"}}>
+              <div style={{width:`${((imgIdx+1)/sessionLength)*100}%`,height:"100%",background:C.accent,borderRadius:99,transition:"width 0.4s ease"}}/>
+            </div>
+          </div>
+        </div>
+        <button onClick={onSubmit}
+          style={{padding:"8px 18px",borderRadius:6,border:"none",background:C.accent,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+          {imgIdx+1>=sessionLength?"Oturumu Bitir":"Sonraki →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Pred bbox paneli ──────────────────────────────────────────────────────
 function PredPanel({pred}){
   if(!pred?.length) return (
@@ -693,7 +1149,7 @@ function ComparisonView({result,sessionImgs,onBack,onFeedbackSubmit}){
         </div>
         <div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:8,padding:12}}>
           <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>IoU Skoru</div>
-          <div style={{fontSize:20,fontWeight:700,color:result.iou!==null?(result.iou>0.5?C.success:C.danger):C.textDim}}>
+          <div style={{fontSize:20,fontWeight:700,color:result.iou!==null?(result.iou>0.3?C.success:C.danger):C.textDim}}>
             {result.iou!==null?result.iou.toFixed(2):"—"}
           </div>
         </div>
@@ -903,6 +1359,8 @@ export default function App(){
   const [physicianId, setPhysicianId] = useState(null);
   const [showNameModal, setShowNameModal] = useState(false);
   const [pendingMode, setPendingMode] = useState(null);
+  const [showInstructions, setShowInstructions] = useState(false);
+  const [showFullscreen, setShowFullscreen] = useState(false);
 
   // Image cache for pre-loading
   const imageCache = useImageCache(sessionImgs, imgIdx);
@@ -968,6 +1426,7 @@ export default function App(){
     setShowGt(false); 
     setShowPred(m==="ai");
     setPhase("session");
+    setShowInstructions(true);
   };
 
   const startOtherSession=()=>{
@@ -1032,11 +1491,13 @@ export default function App(){
     }
   };
 
-  const reset=()=>{setPhase("home");setMode(null);setPhysicianId(null);setImgIdx(0);setResults([]);setBoxes([]);setSelIdx(null);setSessionImgs([]);setPendingMode(null);};
+  const reset=()=>{setPhase("home");setMode(null);setPhysicianId(null);setImgIdx(0);setResults([]);setBoxes([]);setSelIdx(null);setSessionImgs([]);setPendingMode(null);setShowInstructions(false);setShowFullscreen(false);};
 
   return (
     <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'DM Sans','Segoe UI',sans-serif",paddingBottom:48}}>
       {showNameModal && <NameInputModal onStart={handleNameSubmit} />}
+      {showInstructions && <SessionInstructionModal mode={mode} onAcknowledge={()=>setShowInstructions(false)} />}
+      {showFullscreen && <FullscreenViewer imageData={imageData} boxes={boxes} selectedIdx={selIdx} onBoxesChange={setBoxes} onSelectIdx={setSelIdx} showGt={showGt} showPred={showPred} onShowPredToggle={()=>setShowPred(v=>!v)} aiMode={mode==="ai"} mode={mode} imgIdx={imgIdx} sessionLength={sessionImgs.length} onSubmit={submit} onClose={()=>setShowFullscreen(false)} />}
 
       {/* Header */}
       <div style={{borderBottom:`1px solid ${C.border}`,padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:C.surface,position:"sticky",top:0,zIndex:10}}>
@@ -1142,6 +1603,10 @@ export default function App(){
                   {showPred?"Pred Gizle":"Pred Göster"}
                 </button>
               )}
+              <button onClick={()=>setShowFullscreen(true)}
+                style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${C.border}`,background:"transparent",color:C.text,fontSize:12,cursor:"pointer",fontWeight:500}}>
+                ⛶ Tam Ekran
+              </button>
               <button onClick={submit}
                 style={{padding:"6px 16px",borderRadius:6,border:"none",background:C.accent,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer"}}>
                 {imgIdx+1>=sessionImgs.length?"Oturumu Bitir":"Sonraki →"}
